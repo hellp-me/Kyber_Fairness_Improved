@@ -25,9 +25,9 @@
 
 #define KYBER_MIN_WEIGHT		1
 #define KYBER_MAX_WEIGHT		1000
-#define KYBER_WEIGHT_LEGACY_DFL	100
+#define KYBER_WEIGHT_LEGACY_DFL		100
 #define KYBER_MAX_CGROUP		100
-#define KYBER_REFILL_TIME		100//ms
+#define KYBER_REFILL_TIME		100 //ms
 #define KYBER_SCALE_FACTOR		16
 
 /*
@@ -737,14 +737,18 @@ static void kyber_refill_budget(struct request_queue *q)
 
 		spin_lock(&kf->lock);
 		if (kf->cur_budget != kf->next_budget) {
+			printk("kyber-fairness : Cgroup %d is NOT idle.. \n",id);
 			used += kf->next_budget - kf->cur_budget;
 			if (kf->cur_budget > 0)
 				remainder += kf->cur_budget;
 			active_weight += kf->weight;
+			printk("kyber-fairness: Budget Status... \nB_used_%d = %lld, B_remainder_%d = %lld, \nW_active = %d, used = %lld, remainder = %lld\n", id,(kf->next_budget - kf->cur_budget), id, kf->cur_budget, active_weight, used, remainder);
+
 		} else {
 			kf->idle = true;
 			kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
 			kf->cur_budget = kf->next_budget;
+			printk("kyber-fairness : Cgroup %d is idle.. \n",id);
 		}
 		spin_unlock(&kf->lock);
 	}
