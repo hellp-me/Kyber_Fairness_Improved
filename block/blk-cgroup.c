@@ -1471,19 +1471,10 @@ EXPORT_SYMBOL_GPL(blkcg_deactivate_policy);
  * Register @pol with blkcg core.  Might sleep and @pol may be modified on
  * successful registration.  Returns 0 on success and -errno on failure.
  */
-int blkcg_policy_register(struct blkcg_policy *pol, struct elevator_type *e)
+int blkcg_policy_register(struct blkcg_policy *pol)
 {
 	struct blkcg *blkcg;
 	int i, ret;
-	int k = 1;
-	char *elv_name;
-
-	if (!e) {
-		elv_name = "throtle";
-	}
-	else {
-		elv_name = e->elevator_name;
-	}
 
 	mutex_lock(&blkcg_pol_register_mutex);
 	mutex_lock(&blkcg_pol_mutex);
@@ -1507,15 +1498,10 @@ int blkcg_policy_register(struct blkcg_policy *pol, struct elevator_type *e)
 	pol->plid = i;
 	blkcg_policy[pol->plid] = pol;
 
-	printk(KERN_INFO "io scheduler %s's plid is %d\n", elv_name, pol->plid);
-  	printk(KERN_INFO "io scheduler %s alloc and init blkcg_policy_data\n", elv_name);
-
 	/* allocate and install cpd's */
 	if (pol->cpd_alloc_fn) {
 		list_for_each_entry(blkcg, &all_blkcgs, all_blkcgs_node) {
 			struct blkcg_policy_data *cpd;
-
-			printk(KERN_INFO "%d th blkcg \n", k);
 
 			cpd = pol->cpd_alloc_fn(GFP_KERNEL);
 			if (!cpd)
@@ -1525,9 +1511,6 @@ int blkcg_policy_register(struct blkcg_policy *pol, struct elevator_type *e)
 			cpd->blkcg = blkcg;
 			cpd->plid = pol->plid;
 			pol->cpd_init_fn(cpd);
-
-			printk(KERN_INFO "%d th blkcg : cpd alloc and init success! \n", k);
-			k++;
 		}
 	}
 

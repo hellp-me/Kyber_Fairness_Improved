@@ -385,7 +385,7 @@ static struct cftype kyber_blkcg_legacy_files[] = {
 		.seq_show = blkg_print_stat_bytes_recursive,
 	},
 	{
-		.name = "bfq.io_serviced_recursive",
+		.name = "kyber.io_serviced_recursive",
 		.private = (unsigned long)&blkcg_policy_kyber,
 		.seq_show = blkg_print_stat_ios_recursive,
 	},
@@ -545,7 +545,7 @@ static struct blkcg_policy blkcg_policy_kyber = {
 
 	.cpd_alloc_fn = kyber_cpd_alloc,
 	.cpd_init_fn = kyber_cpd_init,
-	.cpd_bind_fn = kyyber_cpd_init,
+	.cpd_bind_fn = kyber_cpd_init,
 	.cpd_free_fn = kyber_cpd_free,
 
 	.pd_alloc_fn = kyber_pd_alloc,
@@ -1714,7 +1714,7 @@ static int __init kyber_init(void)
 {
 	int ret;
 
-	ret = blkcg_policy_register(&blkcg_policy_kyber, &kyber_sched);
+	ret = blkcg_policy_register(&blkcg_policy_kyber);
 	if (ret)
 		return ret;
 

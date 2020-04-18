@@ -2482,7 +2482,7 @@ static int __init throtl_init(void)
 	if (!kthrotld_workqueue)
 		panic("Failed to create kthrotld\n");
 
-	return blkcg_policy_register(&blkcg_policy_throtl, null);
+	return blkcg_policy_register(&blkcg_policy_throtl);
 }
 
 module_init(throtl_init);
