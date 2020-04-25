@@ -177,7 +177,7 @@ struct kyber_fairness {
      * Range : -10 ~ 9
      * Defalult : 0, the highest : -10, the least : 9 
 	 */
-	s64 nice_value // priority of cgroup.
+	s64 nice_value; // priority of cgroup.
 
 	bool idle;
 	spinlock_t lock;
@@ -1480,7 +1480,6 @@ static bool kyber_has_work(struct blk_mq_hw_ctx *hctx)
 	struct kyber_fairness_global *kfg = kqd->kfg;
 	struct kyber_fairness *kf;
 	struct kyber_id_list *id_list = khd->cur_id;
-<<<<<<< HEAD
 
 	if (!id_list)
 		goto remain;
@@ -1492,7 +1491,6 @@ static bool kyber_has_work(struct blk_mq_hw_ctx *hctx)
 			return true;
 	}
 
-=======
 
 	if (!id_list)
 		goto remain;
@@ -1504,7 +1502,6 @@ static bool kyber_has_work(struct blk_mq_hw_ctx *hctx)
 			return true;
 	}
 
->>>>>>> 48bc4f61d7ffe47cbccb952953a4cdc405e2cdf7
 remain:
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
 		if (id_list == khd->cur_id)
