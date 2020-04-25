@@ -171,6 +171,14 @@ struct kyber_fairness {
 	s64 next_budget;
 	s64 cur_budget;
 
+	/*
+	 * Modified by Hyeonsoo Kim
+	 * The Nice value : Priority score, mimic of process scheduling.
+     * Range : -10 ~ 9
+     * Defalult : 0, the highest : -10, the least : 9 
+	 */
+	s64 nice_value // priority of cgroup.
+
 	bool idle;
 	spinlock_t lock;
 };
@@ -417,7 +425,7 @@ static void kyber_pd_init(struct blkg_policy_data *pd)
 	kf->weight = kfd->weight;
 	kf->next_budget = kfd->weight * KYBER_SCALE_FACTOR;
 	kf->cur_budget = kf->next_budget;
-
+	kf->nice_value = 0;
 	kf->idle = true;
 	spin_lock_init(&kf->lock);
 
@@ -737,10 +745,12 @@ static void kyber_refill_budget(struct request_queue *q)
 			if (kf->cur_budget > 0)
 				remainder += kf->cur_budget;
 			active_weight += kf->weight;
+			printk(KERN_INFO "[KF] Cgroup %d : used = %lld, remainder = %lld, active_weight = %lld, budget = %lld", kf->id, used, remainder, active_weight, kf->cur_budget);
 		} else {
 			kf->idle = true;
 			kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
 			kf->cur_budget = kf->next_budget;
+			printk(KERN_INFO "\t[!] This Cgroup is IDLE... budget weighted");
 		}
 		spin_unlock(&kf->lock);
 	}
@@ -770,6 +780,7 @@ static void kyber_refill_budget(struct request_queue *q)
 				kf->next_budget = div_u64(used * kf->weight, active_weight);
 				kf->cur_budget = kf->next_budget;
 				kf->next_budget = kf->cur_budget;
+				printk(KERN_INFO "\t[*] allocated budget = %lld", kf->cur_budget);
 			}
 			spin_unlock(&kf->lock);
 		}
@@ -1469,6 +1480,7 @@ static bool kyber_has_work(struct blk_mq_hw_ctx *hctx)
 	struct kyber_fairness_global *kfg = kqd->kfg;
 	struct kyber_fairness *kf;
 	struct kyber_id_list *id_list = khd->cur_id;
+<<<<<<< HEAD
 
 	if (!id_list)
 		goto remain;
@@ -1480,6 +1492,19 @@ static bool kyber_has_work(struct blk_mq_hw_ctx *hctx)
 			return true;
 	}
 
+=======
+
+	if (!id_list)
+		goto remain;
+
+	list_for_each_entry_from_rcu(id_list, &kfg->use_list, list) {
+		kf = id_list->kf;
+
+		if (kyber_is_active(kf->id, hctx))
+			return true;
+	}
+
+>>>>>>> 48bc4f61d7ffe47cbccb952953a4cdc405e2cdf7
 remain:
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
 		if (id_list == khd->cur_id)
