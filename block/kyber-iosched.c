@@ -29,7 +29,7 @@
 #define KYBER_MAX_CGROUP		100
 #define KYBER_REFILL_TIME		100//ms
 #define KYBER_SCALE_FACTOR		16
-
+#define KYBER_DEFAULT_PRIORITY	10
 /*
  * Scheduling domains: the device is divided into multiple domains based on the
  * request type.
@@ -147,6 +147,13 @@ struct kyber_cpu_latency {
  * we use request->mq_ctx->index_hw to index the kcq in khd.
  */
 struct kyber_ctx_queue {
+
+	/*
+	 * Queue for priority of request
+	 * request will be queued in priority_rq accrding to their nice value. 
+	 */
+	struct list_head priority_rq[20];
+
 	/*
 	 * Used to ensure operations on rq_list and kcq_map to be an atmoic one.
 	 * Also protect the rqs on rq_list when merge.
@@ -173,15 +180,30 @@ struct kyber_fairness {
 
 	/*
 	 * Modified by Hyeonsoo Kim
-	 * The Nice value : Priority score, mimic of process scheduling.
-     * Range : -10 ~ 9
-     * Defalult : 0, the highest : -10, the least : 9 
+	 * The Nice value : Priority score, mimic of The nice value for process scheduling.
+	 * Range : -10 ~ 9
+	 * Defalult : 0, the highest : -10, the least : 9
+	 * Priority of cgroup is calulated following form
+	 *   (High) 0 <= (Priority of cgroup) = ( Nice value of cgroup ) + KYBER_DEFAULT_PRIORITY(=10)  <= 19 (Low)
 	 */
-	s64 nice_value; // priority of cgroup.
+	s64 nice_value; // priority of cgroup. 
 
 	bool idle;
 	spinlock_t lock;
 };
+
+const s64 kyber_fairness_getnice(struct kyber_fairness *kf) {
+	return kf->nice_value;
+}
+
+bool kyber_fairness_setnice(struct kyber_fairness *kf, s64 _nice) {
+	if ( kf && ( (_nice <= -10) && ( _nice >= 9) ) ) {
+		kf->nice_value = _nice;
+	} else {
+		return false;
+	}
+	return true;	 	
+}
 
 struct kyber_id_list {
 	struct kyber_fairness *kf;
@@ -745,12 +767,12 @@ static void kyber_refill_budget(struct request_queue *q)
 			if (kf->cur_budget > 0)
 				remainder += kf->cur_budget;
 			active_weight += kf->weight;
-			printk(KERN_INFO "[KF] Cgroup %d : used = %lld, remainder = %lld, active_weight = %lld, budget = %lld", kf->id, used, remainder, active_weight, kf->cur_budget);
+			printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d) : used = %lld, remainder = %lld, active_weight = %d, budget = %lld", kf->id, kf->weight, used, remainder, active_weight, kf->cur_budget);
 		} else {
 			kf->idle = true;
 			kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
 			kf->cur_budget = kf->next_budget;
-			printk(KERN_INFO "\t[!] This Cgroup is IDLE... budget weighted");
+			printk(KERN_INFO "\t[!] Cgroup %d is IDLE... budget weighted in setted value of weight(=%d)", kf->id, kf->weight);
 		}
 		spin_unlock(&kf->lock);
 	}
@@ -777,10 +799,11 @@ static void kyber_refill_budget(struct request_queue *q)
 
 			spin_lock(&kf->lock);
 			if (!kf->idle) {
+				printk(KERN_INFO "\t[!] Cgroup %d is NOT IDLE! budget adjusted... ", kf->id);
 				kf->next_budget = div_u64(used * kf->weight, active_weight);
 				kf->cur_budget = kf->next_budget;
 				kf->next_budget = kf->cur_budget;
-				printk(KERN_INFO "\t[*] allocated budget = %lld", kf->cur_budget);
+				printk(KERN_INFO "\t\t[*] The amount of budget of Cgroup %d = %lld", kf->id, kf->cur_budget);
 			}
 			spin_unlock(&kf->lock);
 		}
