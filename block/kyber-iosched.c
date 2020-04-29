@@ -29,7 +29,11 @@
 #define KYBER_MAX_CGROUP		100
 #define KYBER_REFILL_TIME		100//ms
 #define KYBER_SCALE_FACTOR		16
+
 #define KYBER_DEFAULT_PRIORITY	10
+#define CGROUP_PRIO(nice)
+
+
 /*
  * Scheduling domains: the device is divided into multiple domains based on the
  * request type.
@@ -160,6 +164,7 @@ struct kyber_ctx_queue {
 	 */
 	spinlock_t lock;
 	struct list_head rq_list[KYBER_MAX_CGROUP][KYBER_NUM_DOMAINS];
+
 } ____cacheline_aligned_in_smp;
 
 struct kyber_fairness_data {
@@ -198,7 +203,9 @@ const s64 kyber_fairness_getnice(struct kyber_fairness *kf) {
 
 bool kyber_fairness_setnice(struct kyber_fairness *kf, s64 _nice) {
 	if ( kf && ( (_nice <= -10) && ( _nice >= 9) ) ) {
+		spin_lock(&(kf->lock));
 		kf->nice_value = _nice;
+		spin_unlock(&(kf->lock));
 	} else {
 		return false;
 	}
@@ -1221,15 +1228,21 @@ static void kyber_insert_requests(struct blk_mq_hw_ctx *hctx,
 
 		head = &kcq->rq_list[id][sched_domain];
 
+
 		spin_lock(&kcq->lock);
+
 		if (at_head)
 			list_move(&rq->queuelist, head);
 		else
 			list_move_tail(&rq->queuelist, head);
+
 		sbitmap_set_bit(&khd->kcq_map[id][sched_domain],
 				rq->mq_ctx->index_hw[hctx->type]);
+
 		blk_mq_sched_request_inserted(rq);
+
 		spin_unlock(&kcq->lock);
+
 	}
 }
 
