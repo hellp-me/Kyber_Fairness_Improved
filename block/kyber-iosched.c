@@ -873,15 +873,23 @@ static unsigned int kyber_sched_tags_shift(struct request_queue* q)
 	return q->queue_hw_ctx[0]->sched_tags->bitmap_tags.sb.shift;
 }
 
+s64 bonus_nice(u64 used_budget){
+	s64 res = (s64)(div_u64(used_budget,KYBER_SCALE_FACTOR)) / 100;
+	if (res >= 10) res = 10;
+	return res; 
+}
+
+
 static void kyber_refill_budget(struct request_queue* q)
 {
 	struct kyber_queue_data* kqd = q->elevator->elevator_data;
 	struct kyber_fairness_global* kfg = kqd->kfg;
 	struct kyber_fairness* kf;
 	struct kyber_id_list* id_list;
-	u64 spend_time, temp, used = 0, remainder = 0;
+	u64 spend_time, temp, cg_used=0, used = 0, remainder = 0;
 	unsigned int active_weight = 0;
 	int shortened = -1;
+	s64 nice_temp, dynamic_nice = 0;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
@@ -889,11 +897,21 @@ static void kyber_refill_budget(struct request_queue* q)
 
 		spin_lock(&kf->lock);
 		if (kf->cur_budget != kf->next_budget) {
-			used += kf->next_budget - kf->cur_budget;
+			cg_used += kf->next_budget - kf->cur_budget;
+			used += cg_used;
 			if (kf->cur_budget > 0)
 				remainder += kf->cur_budget;
 			active_weight += kf->weight;
-			printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d) : used = %lld, remainder = %lld, active_weight = %d, budget = %lld", kf->id, kf->weight, used, remainder, active_weight, kf->cur_budget);
+		
+			/*
+			 * Evaluate Priority dynamically.
+			 * If used budget is over 1000 * 1600, then bonus will be big. ( priority will be elevated. )
+			 */
+			nice_temp = min(5-bonus_nice(cg_used),9);
+			dynamic_nice = max(-10. nice_temp);
+			kyber_fairness_setnice(kf,dynamic_nice);
+
+			printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld, nice= %lld ) : used = %lld, remainder = %lld, active_weight = %d, budget = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value),kf->nice_value, used, remainder, active_weight, kf->cur_budget);
 		} else {
 			kf->idle = true;
 			kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
@@ -1584,7 +1602,7 @@ static int kyber_choose_cgroup(struct blk_mq_hw_ctx* hctx)
 	struct kyber_fairness_global* kfg = kqd->kfg;
 	struct kyber_fairness* kf = khd->cur_kf;
 	struct kyber_id_list* id_list;
-	struct kyber_fairness* kf_chosen = NULL;
+	struct kyber_id_list* kf_id_list_chosen = NULL;
 	bool throttle = true;
 
 	rcu_read_lock();
@@ -1598,8 +1616,7 @@ static int kyber_choose_cgroup(struct blk_mq_hw_ctx* hctx)
 			kfg->has_work = true;
 			continue;
 		}
-
-		kf_chosen = khd->cur_kf = kf;
+		kf_id_list_chosen = khd->cur_id = id_list;
 		break;
 
 skip:
@@ -1607,41 +1624,12 @@ skip:
 	}
 	rcu_read_unlock();
 
-	if(kf_chosen) {
+	if(kf_id_list_chosen) {
 		spin_lock(&kfg->use_lock);
-		list_del_rcu(&kf_chosen->id_list->list);
-		list_add_tail_rcu(&kf_chosen->id_list->list, &kfg->use_list);
+		list_del_rcu(&kf_id_list_chosen->list);
+		list_add_tail_rcu(&kf_id_list_chosen->list, &kfg->use_list);
 		spin_unlock(&kfg->use_lock);
-		return kf_chosen->id;
-	}
-
-
-remain:
-	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
-		if (id_list == khd->cur_id)
-			break;
-
-		kf = id_list->kf;
-
-		if (!kyber_is_active(kf->id, hctx))
-			goto skip_remain;
-
-		spin_lock(&kf->lock);
-		if (kf->cur_budget <= 0) {
-			kfg->has_work = true;
-			goto next_remain;
-		}
-		spin_unlock(&kf->lock);
-
-		khd->cur_id = id_list;
-
-		return kf->id;
-skip_remain:
-		spin_lock(&kf->lock);
-		if (!kf->idle && kf->cur_budget > 0)
-			throttle = false;
-next_remain:
-		spin_unlock(&kf->lock);
+		return kf_id_list_chosen->kf->id;
 	}
 
 	if (throttle && hrtimer_try_to_cancel(&kfg->timer) >= 0)
@@ -1654,38 +1642,13 @@ static bool kyber_has_work(struct blk_mq_hw_ctx* hctx)
 {
 	struct request_queue *q = hctx->queue;
 	struct kyber_queue_data *kqd = q->elevator->elevator_data;
-	struct kyber_hctx_data *khd = hctx->sched_data;
 	struct kyber_fairness_global *kfg = kqd->kfg;
 	struct kyber_fairness *kf;
-	struct kyber_id_list *id_list = khd->cur_id;
-
-	if (!id_list)
-		goto remain;
+	struct kyber_id_list* id_list;
+	bool has_work;
 
 	rcu_read_lock();
-	list_for_each_entry_from_rcu(id_list, &kfg->use_list, list) {
-		kf = id_list->kf;
-
-		if (kyber_is_active(kf->id, hctx))
-			return true;
-	}
-
-
-	if (!id_list)
-		goto remain;
-
-	list_for_each_entry_from_rcu(id_list, &kfg->use_list, list) {
-		kf = id_list->kf;
-
-		if (kyber_is_active(kf->id, hctx))
-			return true;
-	}
-
-remain:
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
-		if (id_list == khd->cur_id)
-			break;
-
 		kf = id_list->kf;
 
 		if (kyber_cgroup_is_active(kf->id, hctx)) {
