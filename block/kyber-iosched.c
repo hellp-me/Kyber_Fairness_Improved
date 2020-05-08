@@ -31,7 +31,7 @@
 #define KYBER_SCALE_FACTOR		16
 
 #define KYBER_DEFAULT_PRIORITY	10
-#define CGROUP_PRIO(nice)
+#define CGROUP_PRIO(nice)		(nice+KYBER_DEFAULT_PRIORITY)
 
 
 /*
@@ -153,12 +153,6 @@ struct kyber_cpu_latency {
 struct kyber_ctx_queue {
 
 	/*
-	 * Queue for priority of request
-	 * request will be queued in priority_rq accrding to their nice value. 
-	 */
-	struct list_head priority_rq[20];
-
-	/*
 	 * Used to ensure operations on rq_list and kcq_map to be an atmoic one.
 	 * Also protect the rqs on rq_list when merge.
 	 */
@@ -218,6 +212,19 @@ struct kyber_id_list {
 	struct list_head list;
 };
 
+
+/* 
+ * the Priority groups
+ * struxt priority_group_data is data of group of cgroups have the same priority.
+ */
+
+struct priority_group_data {
+	s64 cur_belong_budget; // Budget is belonged to priority group in current. 
+	s64 next_belong_budget; // The ammount of budget will be changed in a priority group. 
+	s64 sum_of_budget;		// The sun of budgets of all cgroups have the same nice value(priority).
+	bool no_cgroup;
+};
+
 struct kyber_fairness_global {
 	struct request_queue *q;
 
@@ -234,7 +241,10 @@ struct kyber_fairness_global {
 
 	u64 last_refill_time;
 	bool has_work;
+
+	struct priority_group_data pdata[20]; // priority groups
 };
+
 
 struct kyber_queue_data {
 	struct request_queue *q;
@@ -949,6 +959,14 @@ static struct kyber_fairness_global *kyber_fairness_global_init
 
 	kfg->last_refill_time = ktime_get_ns();
 	kfg->has_work = false;
+
+	for ( i = 0; i < 20 ; i++ ) {
+		kfg->pdata[i].no_cgroup=true;
+		kfg->pdata[i].cur_belong_budget = 0;
+		kfg->pdata[i].next_belong_budget = 0;
+		kfg->pdata[i].sum_of_budget = 0;
+	}
+
 
 	hrtimer_init(&kfg->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	kfg->timer.function = kyber_refill_fn;
