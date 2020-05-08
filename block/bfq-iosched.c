@@ -6339,7 +6339,7 @@ static int __init bfq_init(void)
 	int ret;
 
 #ifdef CONFIG_BFQ_GROUP_IOSCHED
-	ret = blkcg_policy_register(&blkcg_policy_bfq, &iosched_bfq_mq);
+	ret = blkcg_policy_register(&blkcg_policy_bfq);
 	if (ret)
 		return ret;
 #endif
