@@ -879,6 +879,13 @@ s64 bonus_nice(u64 used_budget){
 	return res; 
 }
 
+s64 _max (s64 a, s64 b) {
+	return a>=b ? a: b;
+}
+
+s64 _min (s64 a, s64 b) {
+	return a <= b ? a: b;
+}
 
 static void kyber_refill_budget(struct request_queue* q)
 {
@@ -907,8 +914,8 @@ static void kyber_refill_budget(struct request_queue* q)
 			 * Evaluate Priority dynamically.
 			 * If used budget is over 1000 * 1600, then bonus will be big. ( priority will be elevated. )
 			 */
-			nice_temp = min(5-bonus_nice(cg_used),9);
-			dynamic_nice = max(-10. nice_temp);
+			nice_temp = _min(5-bonus_nice(cg_used),9);
+			dynamic_nice = _max(-10, nice_temp);
 			kyber_fairness_setnice(kf,dynamic_nice);
 
 			printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld, nice= %lld ) : used = %lld, remainder = %lld, active_weight = %d, budget = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value),kf->nice_value, used, remainder, active_weight, kf->cur_budget);
