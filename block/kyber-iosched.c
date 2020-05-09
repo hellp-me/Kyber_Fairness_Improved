@@ -33,8 +33,8 @@
 #define KYBER_DEFAULT_PRIORITY	10
 #define CGROUP_PRIO(nice)		(nice+KYBER_DEFAULT_PRIORITY)
 
-
 extern struct list_head all_blkcgs;
+
  /*
   * Scheduling domains: the device is divided into multiple domains based on the
   * request type.
@@ -196,10 +196,8 @@ const s64 kyber_fairness_getnice(struct kyber_fairness *kf) {
 }
 
 bool kyber_fairness_setnice(struct kyber_fairness *kf, s64 _nice) {
-	if ( kf && ( (_nice <= -10) && ( _nice >= 9) ) ) {
-		spin_lock(&(kf->lock));
+	if ( kf && ( (_nice >= -10) && ( _nice <= 9) ) ) {
 		kf->nice_value = _nice;
-		spin_unlock(&(kf->lock));
 	} else {
 		return false;
 	}
@@ -873,8 +871,8 @@ static unsigned int kyber_sched_tags_shift(struct request_queue* q)
 	return q->queue_hw_ctx[0]->sched_tags->bitmap_tags.sb.shift;
 }
 
-s64 bonus_nice(u64 used_budget){
-	s64 res = (s64)(div_u64(used_budget,KYBER_SCALE_FACTOR)) / 100;
+s64 bonus_nice(u64 remainder_budget){
+	s64 res = (s64)(div_u64(remainder_budget,KYBER_SCALE_FACTOR)) / 100;
 	if (res >= 10) res = 10;
 	return res; 
 }
@@ -914,11 +912,11 @@ static void kyber_refill_budget(struct request_queue* q)
 			 * Evaluate Priority dynamically.
 			 * If used budget is over 1000 * 1600, then bonus will be big. ( priority will be elevated. )
 			 */
-			nice_temp = _min(5-bonus_nice(cg_used),9);
+			nice_temp = _min(5-bonus_nice(kf->cur_budget),9);
 			dynamic_nice = _max(-10, nice_temp);
 			kyber_fairness_setnice(kf,dynamic_nice);
 
-			printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld, nice= %lld ) : used = %lld, remainder = %lld, active_weight = %d, budget = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value),kf->nice_value, used, remainder, active_weight, kf->cur_budget);
+			printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld, nice= %lld ) : used = %lld, remainder = %lld, active_weight = %d, budget = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value),kf->nice_value, cg_used, remainder, active_weight, kf->cur_budget);
 		} else {
 			kf->idle = true;
 			kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
@@ -1920,6 +1918,7 @@ static void __exit kyber_exit(void)
 
 module_init(kyber_init);
 module_exit(kyber_exit);
+
 
 MODULE_AUTHOR("Omar Sandoval");
 MODULE_LICENSE("GPL");

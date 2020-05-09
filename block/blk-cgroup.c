@@ -50,7 +50,7 @@ struct cgroup_subsys_state * const blkcg_root_css = &blkcg_root.css;
 
 static struct blkcg_policy *blkcg_policy[BLKCG_MAX_POLS];
 
-static LIST_HEAD(all_blkcgs);		/* protected by blkcg_pol_mutex */
+LIST_HEAD(all_blkcgs);		/* protected by blkcg_pol_mutex */
 
 static bool blkcg_debug_stats = false;
 
