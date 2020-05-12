@@ -30,9 +30,6 @@
 #define KYBER_REFILL_TIME		100//ms
 #define KYBER_SCALE_FACTOR		16
 
-#define KYBER_DEFAULT_PRIORITY	10
-#define CGROUP_PRIO(nice)		(nice+KYBER_DEFAULT_PRIORITY)
-
 extern struct list_head all_blkcgs;
 
  /*
@@ -180,23 +177,21 @@ struct kyber_fairness {
 	/*
 	 * Modified by Hyeonsoo Kim
 	 * The Nice value : Priority score, mimic of The nice value for process scheduling.
-	 * Range : -10 ~ 9
-	 * Defalult : 0, the highest : -10, the least : 9
-	 * Priority of cgroup is calulated following form
-	 *   (High) 0 <= (Priority of cgroup) = ( Nice value of cgroup ) + KYBER_DEFAULT_PRIORITY(=10)  <= 19 (Low)
+	 * Range : 0 ~ 19
+	 * Defalult : 0, the highest : 0, the least : 19
 	 */
-	s64 nice_value; // priority of cgroup. 
+	u64 nice_value; // priority of cgroup. 
 
 	bool idle;
 	spinlock_t lock;
 };
 
-const s64 kyber_fairness_getnice(struct kyber_fairness *kf) {
+static const u64 kyber_fairness_getnice(struct kyber_fairness *kf) {
 	return kf->nice_value;
 }
 
-bool kyber_fairness_setnice(struct kyber_fairness *kf, s64 _nice) {
-	if ( kf && ( (_nice >= -10) && ( _nice <= 9) ) ) {
+static bool kyber_fairness_setnice(struct kyber_fairness *kf, s64 _nice) {
+	if ( kf && ( (_nice >= 0) && ( _nice <= 19) ) ) {
 		kf->nice_value = _nice;
 	} else {
 		return false;
@@ -217,9 +212,10 @@ struct kyber_id_list {
  */
 
 struct priority_group_data {
-	s64 cur_belong_budget; // Budget is belonged to priority group in current. 
-	s64 next_belong_budget; // The ammount of budget will be changed in a priority group. 
-	s64 sum_of_budget;		// The sun of budgets of all cgroups have the same nice value(priority).
+	u64 nofcg;
+	u64 cur_belong_budget; // Budget is belonged to priority group in current. 
+	u64 next_belong_budget; // The ammount of budget will be changed in a priority group. 
+	u64 sum_of_weight;		// The sun of budgets of all cgroups have the same nice value(priority).
 	bool no_cgroup;
 };
 
@@ -246,6 +242,7 @@ struct kyber_fairness_global {
 	u64 last_refill_time;
 	bool has_work;
 
+	spinlock_t pglock;
 	struct priority_group_data pdata[20]; // priority groups
 };
 
@@ -560,13 +557,22 @@ static void kyber_pd_init(struct blkg_policy_data* pd)
 	struct kyber_queue_data* kqd = blkg->q->elevator->elevator_data;
 	struct kyber_fairness_global* kfg = kqd->kfg;
 	struct kyber_fairness* kf = pd_to_kf(pd);
+	struct priority_group_data* pgd;
 	struct kyber_id_list* id_list;
 
 	kf->weight = kfd->weight;
 	kf->next_budget = kfd->weight * KYBER_SCALE_FACTOR;
 	kf->cur_budget = kf->next_budget;
-	kf->nice_value = 0;
+	kf->nice_value = 10;
 	kf->idle = true;
+
+	pgd = &(kfg-> pdata[kf->nice_value]);
+	if(pgd->no_cgroup) pgd->no_cgroup=false;
+    pgd->cur_belong_budget += kf->cur_budget;
+    pgd->next_belong_budget += kf->next_budget;
+    pgd->sum_of_weight += kf->weight;
+	pgd->nofcg+=1;
+
 	spin_lock_init(&kf->lock);
 
 	id_list = list_first_or_null_rcu(&kfg->free_list,
@@ -871,19 +877,45 @@ static unsigned int kyber_sched_tags_shift(struct request_queue* q)
 	return q->queue_hw_ctx[0]->sched_tags->bitmap_tags.sb.shift;
 }
 
-s64 bonus_nice(u64 remainder_budget){
-	s64 res = (s64)(div_u64(remainder_budget,KYBER_SCALE_FACTOR)) / 100;
+static inline u64 bonus_nice(u64 remainder_budget){
+	u64 res = (div_u64(remainder_budget,KYBER_SCALE_FACTOR)) / 100;
 	if (res >= 10) res = 10;
 	return res; 
 }
 
-s64 _max (s64 a, s64 b) {
+static inline u64 _max (u64 a, u64 b) {
 	return a>=b ? a: b;
 }
 
-s64 _min (s64 a, s64 b) {
+static inline u64 _min (u64 a, u64 b) {
 	return a <= b ? a: b;
 }
+
+static inline void reallocate_priority_group(struct kyber_fairness_global *kfg, struct kyber_fairness *kf, u64 dnice){
+	struct priority_group_data *prev_pd=NULL, *next_pd = NULL;
+	u64 prev = kyber_fairness_getnice(kf);
+	if ( kfg && kf ) {
+		spin_lock(&(kfg->pglock));
+		prev_pd = &(kfg->pdata[prev]);
+		next_pd = &(kfg->pdata[dnice]);
+		
+		if ( kyber_fairness_setnice(kf, dnice) ) {
+
+			prev_pd->nofcg-=1;
+			next_pd->nofcg+=1;
+			if (prev_pd->nofcg == 0) {prev_pd->no_cgroup = false;}
+			if (next_pd->nofcg >= 1) {next_pd->no_cgroup = false;}
+		
+			prev_pd->sum_of_weight -= kf->weight;
+			next_pd->sum_of_weight += kf->weight;
+			printk(KERN_INFO "[KF] Priority Change for Cgroup %d\n\tprio= %lld : weight sum = %lld , %lld cgoups", kf->id, prev, prev_pd->sum_of_weight, prev_pd->nofcg);
+			printk(KERN_INFO "\t[!] changed :: prio= %lld : weight sum = %lld , %lld cgoups", dnice, next_pd->sum_of_weight, next_pd->nofcg);
+		spin_unlock(&(kfg->pglock));
+		}
+  
+	}
+}
+
 
 static void kyber_refill_budget(struct request_queue* q)
 {
@@ -894,7 +926,7 @@ static void kyber_refill_budget(struct request_queue* q)
 	u64 spend_time, temp, cg_used=0, used = 0, remainder = 0;
 	unsigned int active_weight = 0;
 	int shortened = -1;
-	s64 nice_temp, dynamic_nice = 0;
+	u64 nice_temp, dynamic_nice = 0;
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
@@ -912,17 +944,20 @@ static void kyber_refill_budget(struct request_queue* q)
 			 * Evaluate Priority dynamically.
 			 * If used budget is over 1000 * 1600, then bonus will be big. ( priority will be elevated. )
 			 */
-			nice_temp = _min(5-bonus_nice(kf->cur_budget),9);
-			dynamic_nice = _max(-10, nice_temp);
-			kyber_fairness_setnice(kf,dynamic_nice);
+			nice_temp = _min(10-bonus_nice(kf->cur_budget)+5,19);
+			dynamic_nice = _max(0, nice_temp);
+			if ( kyber_fairness_getnice(kf) != dynamic_nice ) {
+				reallocate_priority_group(kfg,kf,dynamic_nice);
+			}
 
-			printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld, nice= %lld ) : used = %lld, remainder = %lld, active_weight = %d, budget = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value),kf->nice_value, cg_used, remainder, active_weight, kf->cur_budget);
+			printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld ) : used = %lld, remainder = %lld, active_weight = %d, budget = %lld", kf->id, kf->weight, kf->nice_value, cg_used, remainder, active_weight, kf->cur_budget);
 		} else {
 			kf->idle = true;
 			kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
 			kf->cur_budget = kf->next_budget;
 			printk(KERN_INFO "\t[!] Cgroup %d is IDLE... budget weighted in setted value of weight(=%d)", kf->id, kf->weight);
 		}
+		cg_used = 0;
 		spin_unlock(&kf->lock);
 	}
 	rcu_read_unlock();
@@ -951,11 +986,14 @@ static void kyber_refill_budget(struct request_queue* q)
 
 			spin_lock(&kf->lock);
 			if (!kf->idle) {
+				//spin_lock(&kfg->pglock);
 				printk(KERN_INFO "\t[!] Cgroup %d is NOT IDLE! budget adjusted... ", kf->id);
 				kf->next_budget = div_u64(used * kf->weight, active_weight);
+				
 				kf->cur_budget = kf->next_budget;
 				kf->next_budget = kf->cur_budget;
 				printk(KERN_INFO "\t\t[*] The amount of budget of Cgroup %d = %lld", kf->id, kf->cur_budget);
+				//spin_unlock(&kfg->pglock);
 			}
 			spin_unlock(&kf->lock);
 		}
@@ -1100,7 +1138,8 @@ static struct kyber_fairness_global* kyber_fairness_global_init
 		kfg->pdata[i].no_cgroup=true;
 		kfg->pdata[i].cur_belong_budget = 0;
 		kfg->pdata[i].next_belong_budget = 0;
-		kfg->pdata[i].sum_of_budget = 0;
+		kfg->pdata[i].sum_of_weight = 0;
+		kfg->pdata[i].nofcg = 0;
 	}
 
 
