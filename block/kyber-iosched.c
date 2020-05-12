@@ -903,7 +903,7 @@ static inline void reallocate_priority_group(struct kyber_fairness_global *kfg, 
 
 			prev_pd->nofcg-=1;
 			next_pd->nofcg+=1;
-			if (prev_pd->nofcg == 0) {prev_pd->no_cgroup = false;}
+			if (prev_pd->nofcg == 0) {prev_pd->no_cgroup = true;}
 			if (next_pd->nofcg >= 1) {next_pd->no_cgroup = false;}
 		
 			prev_pd->sum_of_weight -= kf->weight;
@@ -934,7 +934,7 @@ static void kyber_refill_budget(struct request_queue* q)
 
 		spin_lock(&kf->lock);
 		if (kf->cur_budget != kf->next_budget) {
-			cg_used += kf->next_budget - kf->cur_budget;
+			cg_used = kf->next_budget - kf->cur_budget;
 			used += cg_used;
 			if (kf->cur_budget > 0)
 				remainder += kf->cur_budget;
@@ -946,7 +946,13 @@ static void kyber_refill_budget(struct request_queue* q)
 			 */
 			nice_temp = _min(10-bonus_nice(kf->cur_budget)+5,19);
 			dynamic_nice = _max(0, nice_temp);
+
+			/* 
+			 * Set dynamic priority
+			 * If a dynamic priority is not equal to current priority, it is setted.
+			 */
 			if ( kyber_fairness_getnice(kf) != dynamic_nice ) {
+				// Recaluate data for re-niced priority.
 				reallocate_priority_group(kfg,kf,dynamic_nice);
 			}
 
@@ -989,8 +995,7 @@ static void kyber_refill_budget(struct request_queue* q)
 				//spin_lock(&kfg->pglock);
 				printk(KERN_INFO "\t[!] Cgroup %d is NOT IDLE! budget adjusted... ", kf->id);
 				kf->next_budget = div_u64(used * kf->weight, active_weight);
-				
-				kf->cur_budget = kf->next_budget;
+				kf->cur_budget += kf->next_budget;
 				kf->next_budget = kf->cur_budget;
 				printk(KERN_INFO "\t\t[*] The amount of budget of Cgroup %d = %lld", kf->id, kf->cur_budget);
 				//spin_unlock(&kfg->pglock);
