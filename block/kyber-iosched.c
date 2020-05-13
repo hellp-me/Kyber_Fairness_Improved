@@ -971,7 +971,8 @@ static void kyber_refill_budget(struct request_queue *q)
 				kf->bandwidth = div64_u64(kf->bandwidth * 8, 10);
 				budget_temp = div64_u64(budget_temp * 2, 10);
 			}
-			
+			kf->bandwidth = kf->bandwidth + budget_temp;
+
 			/*
 			 * Evaluate Priority dynamically.
 			 * If used budget is over 1000 * 1600, then bonus will be big. ( priority will be elevated. )
@@ -982,7 +983,7 @@ static void kyber_refill_budget(struct request_queue *q)
 		}
 		else kf->idle = true;
 		
-		printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld, nice= %lld ) : IDLE = %s, budget = %lld, used = %lld, remainder = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value), kf->nice_value, kf->idle ? "O" : "X", kf->next_budget, cg_used, cg_remainder);
+		printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld, nice= %lld ) : IDLE = %s, BW = %lld, budget = %lld, used = %lld, remainder = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value), kf->nice_value, kf->idle ? "O" : "X",kf->bandwidth ,kf->next_budget, cg_used, cg_remainder);
 		spin_unlock(&kf->lock);
 	}
 	rcu_read_unlock();
@@ -994,7 +995,6 @@ static void kyber_refill_budget(struct request_queue *q)
 	 * 
 	 */
 	budget_temp = div_u64(used * NSEC_PER_SEC, (spend_time * spend_time));
-
 	if (remainder) {
 		kfg->bandwidth = div64_u64(kfg->bandwidth * 4, 10);
 		budget_temp = div64_u64(budget_temp * 6, 10);
@@ -1003,6 +1003,7 @@ static void kyber_refill_budget(struct request_queue *q)
 		kfg->bandwidth = div64_u64(kfg->bandwidth * 8, 10);
 		budget_temp = div64_u64(budget_temp * 2, 10);
 	}
+	kfg->bandwidth = kfg->bandwidth + budget_temp;
 
 	if (used < kfg->bandwidth) used = kfg->bandwidth;
 	
@@ -1023,6 +1024,7 @@ static void kyber_refill_budget(struct request_queue *q)
 
 		budget_refill = (amplified_used > remainder) ? (amplified_used - remainder) : 0;
 
+		printk(KERN_INFO "\t[!] BW = %lld ", kfg->bandwidth);
 		printk(KERN_INFO "\t[!] used = %lld ", used);
 		printk(KERN_INFO "\t[!] shortened = %d ", shortened);
 		printk(KERN_INFO "\t[!] amplified_used = %lld ", amplified_used);
