@@ -184,6 +184,8 @@ struct kyber_fairness
 	s64 next_budget;
 	s64 cur_budget;
 
+	s64 bandwidth;
+
 	/*
 	 * Modified by Hyeonsoo Kim
 	 * The Nice value : Priority score, mimic of The nice value for process scheduling.
@@ -245,6 +247,8 @@ struct kyber_fairness_global
 	struct task_struct *timer_thread;
 
 	struct kyber_fairness *root_kf;
+
+	s64 bandwidth;
 
 	spinlock_t use_lock;
 	spinlock_t free_lock;
@@ -930,11 +934,15 @@ static void kyber_refill_budget(struct request_queue *q)
 	struct kyber_fairness *kf;
 	struct kyber_id_list *id_list;
 	u64 spend_time, temp, cg_used = 0, cg_remainder = 0, amplified_used = 0, used = 0, remainder = 0, budget_refill;
+	u64 budget_temp;
 	unsigned int active_weight = 0;
 	int shortened = -1;
 	s64 nice_temp, dynamic_nice = 0;
 
 	printk(KERN_INFO "<----------------START----------------> ");
+
+	spend_time = ktime_get_ns() - kfg->last_refill_time;
+
 	rcu_read_lock();
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list){
 		kf = id_list->kf;
@@ -948,10 +956,22 @@ static void kyber_refill_budget(struct request_queue *q)
 			if (kf->cur_budget < 0) kf->cur_budget = 0;
 			cg_remainder = kf->cur_budget;
 
+
 			used += cg_used;
 			remainder += cg_remainder;
 			active_weight += kf->weight;
 
+			budget_temp = div_u64(cg_used * NSEC_PER_SEC, (spend_time * spend_time));
+
+			if (cg_remainder) {
+				kf->bandwidth = div64_u64(kf->bandwidth * 4, 10);
+				budget_temp = div64_u64(budget_temp * 6, 10);
+			}
+			else {
+				kf->bandwidth = div64_u64(kf->bandwidth * 8, 10);
+				budget_temp = div64_u64(budget_temp * 2, 10);
+			}
+			
 			/*
 			 * Evaluate Priority dynamically.
 			 * If used budget is over 1000 * 1600, then bonus will be big. ( priority will be elevated. )
@@ -967,8 +987,28 @@ static void kyber_refill_budget(struct request_queue *q)
 	}
 	rcu_read_unlock();
 
+	/*
+	 *
+	 * 남은 budget이 있다면, bandwidth를 감소
+	 * 남은 budget이 없다면, bandwidth를 증가
+	 * 
+	 */
+	budget_temp = div_u64(used * NSEC_PER_SEC, (spend_time * spend_time));
+
+	if (remainder) {
+		kfg->bandwidth = div64_u64(kfg->bandwidth * 4, 10);
+		budget_temp = div64_u64(budget_temp * 6, 10);
+	}
+	else {
+		kfg->bandwidth = div64_u64(kfg->bandwidth * 8, 10);
+		budget_temp = div64_u64(budget_temp * 2, 10);
+	}
+
+	if (used < kfg->bandwidth) used = kfg->bandwidth;
+	
+
+
 	if (used){
-		spend_time = ktime_get_ns() - kfg->last_refill_time;
 		while (spend_time < KYBER_REFILL_TIME * NSEC_PER_MSEC) {
 			spend_time += (10 * NSEC_PER_MSEC);
 			shortened++;
@@ -991,7 +1031,7 @@ static void kyber_refill_budget(struct request_queue *q)
 		printk(KERN_INFO "\t[*] budget_refill = %lld ", budget_refill);
 
 		
-		printk(KERN_INFO "\t[!] After budget refill ", kf->id);
+		printk(KERN_INFO "\t[!] After budget refill ");
 		rcu_read_lock();
 		list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
 			kf = id_list->kf;
@@ -1001,12 +1041,14 @@ static void kyber_refill_budget(struct request_queue *q)
 			if (!kf->idle){
 				kf->next_budget = _max(div_u64(budget_refill* kf->weight, active_weight), kf->weight * KYBER_SCALE_FACTOR);
 				kf->next_budget += kf->cur_budget;
+
+				if (kf->bandwidth < kf->next_budget) kf->next_budget = _max(kf->bandwidth, kf->weight * KYBER_SCALE_FACTOR);
 			}
 			else {
 				kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
 			}
-			kf->cur_budget = kf->next_budget;
 
+			kf->cur_budget = kf->next_budget;
 			printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d, prio= %lld) : IDLE = %s, budget = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value), kf->idle ? "O" : "X", kf->next_budget);
 			spin_unlock(&kf->lock);
 		}
@@ -1153,6 +1195,9 @@ static struct kyber_fairness_global *kyber_fairness_global_init(struct kyber_que
 
 	kfg->last_refill_time = ktime_get_ns();
 	kfg->has_work = false;
+
+	// 20MB
+	kfg->bandwidth = 2048 * 10000;
 
 	for (i = 0; i < 20; i++)
 	{
