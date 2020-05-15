@@ -27,13 +27,14 @@
 #define KYBER_MAX_WEIGHT 1000
 #define KYBER_WEIGHT_LEGACY_DFL 100
 #define KYBER_MAX_CGROUP 100
-#define KYBER_REFILL_TIME 100 //ms
+
+#define KYBER_REFILL_TIME 500 //ms
+#define KYBER_IDEAL_REFILL_TIME KYBER_REFILL_TIME-100 
 #define KYBER_SCALE_FACTOR 30
 
 #define KYBER_DEFAULT_PRIORITY 10
 #define CGROUP_PRIO(nice) (nice + KYBER_DEFAULT_PRIORITY)
 
-extern struct list_head all_blkcgs;
 /*
   * Scheduling domains: the device is divided into multiple domains based on the
   * request type.
@@ -185,6 +186,7 @@ struct kyber_fairness
 	s64 cur_budget;
 
 	s64 bandwidth;
+	s64 used;
 
 	/*
 	 * Modified by Hyeonsoo Kim
@@ -933,8 +935,11 @@ static void kyber_refill_budget(struct request_queue *q)
 	struct kyber_fairness_global *kfg = kqd->kfg;
 	struct kyber_fairness *kf;
 	struct kyber_id_list *id_list;
-	u64 spend_time, temp, cg_used = 0, cg_remainder = 0, amplified_used = 0, used = 0, remainder = 0, budget_refill;
-	u64 budget_temp;
+	u64 spend_time, temp;
+	u64 used = 0,remainder = 0, amplified_used = 0;
+	u64 cg_used = 0, cg_remainder = 0;
+	u64 budget_temp, budget_refill;
+	u64 all_idle = true;
 	unsigned int active_weight = 0;
 	int shortened = -1;
 	s64 nice_temp, dynamic_nice = 0;
@@ -943,119 +948,105 @@ static void kyber_refill_budget(struct request_queue *q)
 
 	spend_time = ktime_get_ns() - kfg->last_refill_time;
 
+
 	rcu_read_lock();
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list){
 		kf = id_list->kf;
 
 		spin_lock(&kf->lock);
+
 		if (kf->cur_budget != kf->next_budget) {
 			kf->idle = false;
+			all_idle = false;
 
-			cg_used = kf->next_budget - kf->cur_budget;
+			kf->used = kf->next_budget - kf->cur_budget;
+			used += kf->used;
 
 			if (kf->cur_budget < 0) kf->cur_budget = 0;
 			cg_remainder = kf->cur_budget;
 
-
-			used += cg_used;
 			remainder += cg_remainder;
-			active_weight += kf->weight;
 
-			budget_temp = div_u64(cg_used * NSEC_PER_SEC, (spend_time * spend_time));
 
-			if (cg_remainder) {
-				kf->bandwidth = div64_u64(kf->bandwidth * 4, 10);
-				budget_temp = div64_u64(budget_temp * 6, 10);
+			if(cg_remainder == 0) {
+				active_weight += kf->weight;
 			}
-			else {
-				kf->bandwidth = div64_u64(kf->bandwidth * 8, 10);
-				budget_temp = div64_u64(budget_temp * 2, 10);
-			}
-			kf->bandwidth = kf->bandwidth + budget_temp;
-
-			/*
-			 * Evaluate Priority dynamically.
-			 * If used budget is over 1000 * 1600, then bonus will be big. ( priority will be elevated. )
-			 */
-			nice_temp = _min(5 - bonus_nice(cg_used), 9);
-			dynamic_nice = _max(-10, nice_temp);
-			kyber_fairness_setnice(kf, dynamic_nice);
 		}
 		else kf->idle = true;
 		
-		printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d, prio= %lld, nice= %lld ) : IDLE = %s, BW = %lld, budget = %lld, used = %lld, remainder = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value), kf->nice_value, kf->idle ? "O" : "X",kf->bandwidth ,kf->next_budget, cg_used, cg_remainder);
+		printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d) : IDLE = %s :  budget = %lld, used = %lld, remainder = %lld", 
+			kf->id, kf->weight, kf->idle ? "O" : "X",kf->next_budget, kf->used, cg_remainder);
 		spin_unlock(&kf->lock);
 	}
 	rcu_read_unlock();
 
+
 	/*
-	 *
-	 * 남은 budget이 있다면, bandwidth를 감소
-	 * 남은 budget이 없다면, bandwidth를 증가
+	 * 만약 remainder가 있다면 
 	 * 
 	 */
-	budget_temp = div_u64(used * NSEC_PER_SEC, (spend_time * spend_time));
-	if (remainder) {
-		kfg->bandwidth = div64_u64(kfg->bandwidth * 4, 10);
-		budget_temp = div64_u64(budget_temp * 6, 10);
+	if(remainder == 0 && !all_idle) {
+		// 1 budget = 1 sector = 512 bytes
+		// bandwidth 단위 Bytes/ 1ms
+		// ns -> ms 변환
+		spend_time = div64_u64(spend_time, 1000);
+		kfg->bandwidth = div64_u64(used * 512, spend_time);
 	}
-	else {
-		kfg->bandwidth = div64_u64(kfg->bandwidth * 8, 10);
-		budget_temp = div64_u64(budget_temp * 2, 10);
-	}
-	kfg->bandwidth = kfg->bandwidth + budget_temp;
 
-	if (used < kfg->bandwidth) used = kfg->bandwidth;
+	budget_refill = kfg->bandwidth * KYBER_IDEAL_REFILL_TIME;
+
 	
 
 
-	if (used){
-		while (spend_time < KYBER_REFILL_TIME * NSEC_PER_MSEC) {
-			spend_time += (10 * NSEC_PER_MSEC);
-			shortened++;
-		}
+	/*
+	while (spend_time < KYBER_REFILL_TIME * NSEC_PER_MSEC) {
+		spend_time += (10 * NSEC_PER_MSEC);
+		shortened++;
+	}
 
-		if (shortened < 10) {
-			temp = used * KYBER_REFILL_TIME;
-			amplified_used = div64_u64(temp, KYBER_REFILL_TIME - (10 * shortened));
-		}
-		else amplified_used = used * 10;
-		
+	if (shortened < 10) {
+		temp = used * KYBER_REFILL_TIME;
+		amplified_used = div64_u64(temp, KYBER_REFILL_TIME - (10 * shortened));
+	}
+	else amplified_used = used * 10;
+	*/
 
-		budget_refill = (amplified_used > remainder) ? (amplified_used - remainder) : 0;
+  
 
-		printk(KERN_INFO "\t[!] BW = %lld ", kfg->bandwidth);
-		printk(KERN_INFO "\t[!] used = %lld ", used);
-		printk(KERN_INFO "\t[!] shortened = %d ", shortened);
-		printk(KERN_INFO "\t[!] amplified_used = %lld ", amplified_used);
-		printk(KERN_INFO "\t[!] amplification rate = X %lld ", div64_u64(amplified_used, used));
-		printk(KERN_INFO "\t[!] remainder = %lld ", remainder);
-		printk(KERN_INFO "\t[*] budget_refill = %lld ", budget_refill);
+	//printk(KERN_INFO "\t[@@] used = %lld ", used);
+	printk(KERN_INFO "\t[@@] BW = %lld B/ms ", kfg->bandwidth);
+	//printk(KERN_INFO "\t[!] shortened = %d ", shortened);
+	//printk(KERN_INFO "\t[!] amplified_used = %lld ", amplified_used);
+	//printk(KERN_INFO "\t[!] amplification rate = X %lld ", div64_u64(amplified_used, used));
+	printk(KERN_INFO "\t[!] remainder = %lld ", remainder);
+	printk(KERN_INFO "\t[*] budget_refill = %lld ", budget_refill);
 
-		
-		printk(KERN_INFO "\t[!] After budget refill ");
-		rcu_read_lock();
-		list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
-			kf = id_list->kf;
+	
+	printk(KERN_INFO "\t[!] After budget refill ");
+	rcu_read_lock();
+	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
+		kf = id_list->kf;
 
-			spin_lock(&kf->lock);
+		spin_lock(&kf->lock);
 
-			if (!kf->idle){
-				kf->next_budget = _max(div_u64(budget_refill* kf->weight, active_weight), kf->weight * KYBER_SCALE_FACTOR);
-				kf->next_budget += kf->cur_budget;
-
-				if (kf->bandwidth < kf->next_budget) kf->next_budget = _max(kf->bandwidth, kf->weight * KYBER_SCALE_FACTOR);
+		if (!kf->idle){
+			if (kf->cur_budget == 0) {
+				kf->next_budget = div_u64(budget_refill* kf->weight, active_weight);
 			}
 			else {
-				kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
+				kf->next_budget = kf->used;
 			}
-
-			kf->cur_budget = kf->next_budget;
-			printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d, prio= %lld) : IDLE = %s, budget = %lld", kf->id, kf->weight, CGROUP_PRIO(kf->nice_value), kf->idle ? "O" : "X", kf->next_budget);
-			spin_unlock(&kf->lock);
 		}
-		rcu_read_unlock();
+		else {
+			kf->next_budget = kf->weight * KYBER_SCALE_FACTOR;
+		}
+
+		kf->cur_budget = kf->next_budget;
+		printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d) : IDLE = %s :  budget = %lld", kf->id, kf->weight, kf->idle ? "O" : "X", kf->next_budget);
+		spin_unlock(&kf->lock);
 	}
+	rcu_read_unlock();
+	
 	printk(KERN_INFO "<----------------END----------------> ");
 
 	kfg->last_refill_time = ktime_get_ns();
@@ -1198,8 +1189,10 @@ static struct kyber_fairness_global *kyber_fairness_global_init(struct kyber_que
 	kfg->last_refill_time = ktime_get_ns();
 	kfg->has_work = false;
 
-	// 20MB
-	kfg->bandwidth = 2048 * 10000;
+	// 10MB / 1ms
+	// 100MB / 1s
+	// 10MB -> 약 20,000 budget
+	kfg->bandwidth = 20000;
 
 	for (i = 0; i < 20; i++)
 	{
