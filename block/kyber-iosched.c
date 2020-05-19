@@ -913,8 +913,8 @@ static void kyber_refill_budget(struct request_queue *q)
 
 
 	
-	//printk(KERN_INFO "<----------------START----------------> ");
-	//printk(KERN_INFO "running in cpu %d", smp_processor_id() );
+	printk(KERN_INFO "<----------------START----------------> ");
+	printk(KERN_INFO "running in cpu %d", smp_processor_id() );
 
 	spend_time = ktime_get_ns() - kfg->last_refill_time;
 
