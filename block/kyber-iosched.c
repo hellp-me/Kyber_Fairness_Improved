@@ -274,7 +274,6 @@ struct kyber_hctx_data
 	struct sbq_wait_state *domain_ws[KYBER_NUM_DOMAINS];
 	atomic_t wait_index[KYBER_NUM_DOMAINS];
 	struct kyber_fairness *cur_kf;
-	struct kyber_id_list *cur_id;
 };
 
 static struct blkcg_policy blkcg_policy_kyber;
@@ -988,7 +987,6 @@ static void kyber_refill_budget(struct request_queue *q)
 		budget_refill = (bw_temp + bw_bonus_temp) * KYBER_IDEAL_REFILL_TIME;
 
 	}
-
 	// 모든 cgroup이 idle한 경우
 	else {
 		
@@ -1406,7 +1404,7 @@ static int kyber_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
 	khd->cur_domain = 0;
 	khd->batching = 0;
 
-	khd->cur_id = NULL;
+	khd->cur_kf = kqd->kfg->root_kf;
 
 	hctx->sched_data = khd;
 	sbitmap_queue_min_shallow_depth(&hctx->sched_tags->bitmap_tags,
@@ -1753,21 +1751,22 @@ static int kyber_choose_cgroup(struct blk_mq_hw_ctx *hctx)
 	struct kyber_queue_data *kqd = q->elevator->elevator_data;
 	struct kyber_hctx_data *khd = hctx->sched_data;
 	struct kyber_fairness_global *kfg = kqd->kfg;
-	struct kyber_fairness *kf = khd->cur_kf;
+	struct kyber_fairness *cuf_kf = khd->cur_kf;
+
+	struct kyber_fairness *kf;
 	struct kyber_id_list *id_list;
-	struct kyber_id_list *kf_id_list_chosen = NULL;
+	struct kyber_fairness *kf_choose = NULL;
+
+
 	bool need_refill = true;
 	bool all_idle = true;
 
-
-	// active한 cgroup의 개수 저장
-	int nr_active_cgroup = kfg->nr_active_cgroup;
-	nr_active_cgroup = (nr_active_cgroup > 0) ? nr_active_cgroup : -1;
 
 	//// 설계
 	// 지역성을 활용하기 위해 반드시 이전에 처리한 cgroup 부터 확인해야한다. (이전에 처리한 cgroup = khd->cur_kf)
 	// 만약 이전에 처리한 cgroup이 inactive인 경우 active한 cgroup들부터 확인해야한다.
 	// 만약 refill_budget에서 계산된 active cgroup의 개수가 0인 경우 inactive cgroup의 요청을 처리한다.
+
 
 
 	// 만약 이전에 처리한 cgroup이 active인 경우 확인하고 요청을 처리하지 못하거나 요청이 없는 경우(즉, 건너뛰는 경우)에는
@@ -1776,62 +1775,113 @@ static int kyber_choose_cgroup(struct blk_mq_hw_ctx *hctx)
 	/**** 반드시 로직을 최소화해야함 ****/
 
 
+	// idle cgroup에 대하여
+	// 여기서 idle상태로 마킹되어있는건 레알 idle임 
+	// 즉 요청이 큐에 펜딩되어있는지 확인할 필요도 없음 
+	// 왜냐?
+	// kyber_insert_request에서 요청을 넣을 때 idle상태를 바꿔주기 때문이니깐
+	// 고로 idle하다고 표시된 놈은 무조건 budget이 있는 상태이고 펜딩된 요청이 없는거임
+	// 고로 idle한 놈은 검사할 필요도 없음
+
+
+	// active한 cgroup의 개수 저장
+	int nr_active_cgroup = (kfg->nr_active_cgroup > 0) ? kfg->nr_active_cgroup : -1;
+
+	kf = cuf_kf;
 	rcu_read_lock();
+	if (!kf) goto loop;
+
+	if (kf->cur_budget > 0 && kyber_cgroup_is_active(kf->id, hctx)) {
+		kf_choose = kf;
+		goto choose;
+	}
+
+
+
+loop:
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
 		kf = id_list->kf;
 
-		// active한 cgroup이 budget을 모두 소모한 경우 카운트 감소
-		if (!kf->idle) {
-			if (kf->cur_budget <= 0 && !kf->inactive)
+		/*
+		// active cgroup
+		else if (!kf->idle && !kf->inactive) {
+			if (kf->cur_budget <= 0)  {
 				nr_active_cgroup--;
-			// 만약 해당 cgroup이 inactive하고
-			// budget이 있는 active cgroup이 없다면
-			// inactive cgroup의 요청을 처리하지 않고 곧바로 budget refill을 수행한다
-			else if (kf->inactive && nr_active_cgroup == 0) 
-				goto refill;
-		}
-
-		// pending request가 있는지 검사
-		// pending request가 없다면
-		// idle하지 않다는 것은 다른 kcq-khd에 pending request가 있다는 얘기(not idle)
-		// idle하지 않고 budget이 남아있다면 해당 cgroup은 pending request가 존재하는 kcq-khd 에서 요청을 처리할 것이므로 리필해줄 필요가 없다. 
-		if (!kyber_cgroup_is_active(kf->id, hctx)) 
-			goto skip;
-		
-
-		// pending request가 있으나
-		// budget이 없어서 처리를 못하는 cgroup
-		if (kf->cur_budget <= 0) {
-			kfg->has_work = true;
-			continue;
-		}
-
-		kf_id_list_chosen = khd->cur_id = id_list;
-		break;
-
-		skip:
-		if (!kf->idle) {
-			all_idle = false;
-			if(kf->cur_budget>0) {
-				need_refill = false;
+				if (nr_active_cgroup == 0) goto refill;
+				kfg->has_work = true;
+				continue;
+			}
+			else {
+				if (!kyber_cgroup_is_active(kf->id, hctx)) {
+					all_idle = false;
+					need_refill = false;
+					continue;
+				}
+				else {
+					kf_choose = kf;
+					break;
+				}
 			}
 		}
-		
+
+		// inactive
+		else {
+			if (kf->cur_budget <= 0) {
+				kfg->has_work = true;
+				continue;
+			}
+			else {
+				if (!kyber_cgroup_is_active(kf->id, hctx)) {
+					all_idle = false;
+					need_refill = false;
+					continue;
+				}
+				else {
+					kf_choose = kf;
+					break;
+				}
+			}
+		}
+		*/
+
+		//active, inactive cgroup
+		if(!kf->idle){
+			if (kf->cur_budget <= 0)  {
+				kfg->has_work = true;
+				if(!kf->inactive) {
+					nr_active_cgroup--;
+					if (nr_active_cgroup == 0) {
+						rcu_read_unlock();
+						goto refill;
+					}
+				}
+				continue;
+			}
+			else {
+				if (!kyber_cgroup_is_active(kf->id, hctx)) {
+					all_idle = false;
+					need_refill = false;
+					continue;
+				}
+				else {
+					kf_choose = kf;
+					break;
+				}
+			}
+		}
 	}
+choose:
 	rcu_read_unlock();
 
-
-	if (kf_id_list_chosen){
-		kf = kf_id_list_chosen->kf;
-		// inactive한 경우에만 맨 뒤로 보낸다
+	if (kf_choose){
+		kf = khd->cur_kf = kf_choose;
 		if(kf->inactive) {
 			spin_lock(&kfg->use_lock);
-			list_del_rcu(&kf_id_list_chosen->list);
-			list_add_tail_rcu(&kf_id_list_chosen->list, &kfg->use_list);
+			list_del_rcu(&kf->id_list->list);
+			list_add_tail_rcu(&kf->id_list->list, &kfg->use_list);
 			spin_unlock(&kfg->use_lock);
 		}
 		return kf->id;
-		// printk(KERN_INFO "\t[CHOOSE] choose cgroup %d : weight = %d, budget = %lld, inactive = %s in cpu %d ",kf->id, kf->weight, kf->cur_budget,kf->inactive ?"O":"X", smp_processor_id());
 	}
 
 	if (need_refill && !all_idle) {
