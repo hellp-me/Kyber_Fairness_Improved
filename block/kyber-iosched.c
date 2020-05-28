@@ -28,10 +28,10 @@
 #define KYBER_WEIGHT_LEGACY_DFL 100
 #define KYBER_MAX_CGROUP 100
 
-#define KYBER_REFILL_TIME 400 //ms
-#define KYBER_IDEAL_REFILL_TIME 300
-#define KYBER_MAX_BW 2900000 // 2,900,000 B/ms(2,900MB/s)
-
+#define KYBER_REFILL_TIME 300 //ms
+#define KYBER_IDEAL_REFILL_TIME 150
+#define KYBER_BW_MAX 3145728 // 3,145,728 B/ms (3,000MiB/s)
+#define KYBER_BW_THRESHOLD 524288 // 524,288 B/ms (500MiB/s)
 #define KYBER_SCALE_FACTOR 30
 
 
@@ -898,20 +898,20 @@ static void kyber_refill_budget(struct request_queue *q)
 	struct kyber_id_list *id_list;
 	u64 spend_time;
 	u64 used = 0;
-	u64 cg_remainder = 0;
-	u64 bw_bonus, bw_bonus_temp, bw_temp=0, budget_refill =0;
+	u64 bw_temp=0, budget_refill =0;
 	u64 budget_active = 0, budget_inactive = 0;
 
 	unsigned int weight_active = 0, weight_no_idle = 0, weight_all=0, weight_temp = 0;
 	bool all_idle = true;
+	bool any_inactive = false;
 
 	int nr_active_cgroup = 0;
-	int nr_exhaustive_cgroup = 0;
+
 
 
 	
-	printk(KERN_INFO "<----------------START----------------> ");
-	printk(KERN_INFO "running in cpu %d", smp_processor_id() );
+	//printk(KERN_INFO "<----------------START----------------> ");
+	//printk(KERN_INFO "running in cpu %d", smp_processor_id() );
 
 	spend_time = ktime_get_ns() - kfg->last_refill_time;
 
@@ -928,18 +928,19 @@ static void kyber_refill_budget(struct request_queue *q)
 			used += kf->used;
 
 			if (kf->cur_budget < 0) kf->cur_budget = 0;
-			cg_remainder = kf->cur_budget;
+
 
 			// inactive 판정
 			// original_budget의 40% 이하를 사용하였을 경우 inactive하다고 판별
-			if (kf->used < div_u64(kf->original_budget * 30 , 100)) {
+			if (kf->used < div_u64(kf->original_budget * 40 , 100)) {
 				kf->inactive = true;
+				any_inactive = true;
 			}
 			else {
 				kf->inactive = false;
 				nr_active_cgroup++;
 				weight_active += kf->weight;
-				if(cg_remainder == 0) nr_exhaustive_cgroup++;
+
 			}
 
 			
@@ -947,15 +948,14 @@ static void kyber_refill_budget(struct request_queue *q)
 			weight_no_idle += kf->weight;
 		}
 		else {
-			cg_remainder = kf->cur_budget;
 			kf->used = 0;
 			kf->idle = true;
 			kf->inactive = false;
 		}
 		weight_all += kf->weight;
 		spin_unlock(&kf->lock);
-		printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d,) : IDLE = %s, inactive = %s :  budget = %lld, used = %lld, remainder = %lld", 
-			kf->id, kf->weight,kf->idle ? "O" : "X", kf->inactive ? "O" : "X",kf->next_budget, kf->used, cg_remainder);
+		//printk(KERN_INFO "[KF] Cgroup %d (weight_value= %d,) : IDLE = %s, inactive = %s :  budget = %lld, used = %lld, remainder = %lld", 
+		//	kf->id, kf->weight,kf->idle ? "O" : "X", kf->inactive ? "O" : "X",kf->next_budget, kf->used, cg_remainder);
 	}
 	rcu_read_unlock();
 
@@ -974,29 +974,24 @@ static void kyber_refill_budget(struct request_queue *q)
 		bw_temp = div64_u64(used, spend_time);
 
 
-		bw_bonus_temp = 0;
-		bw_bonus = 0;
-		//if (nr_exhaustive_cgroup == nr_active_cgroup) {
-		//	bw_bonus_temp = div64_u64(bw_temp, 5);
-		//	bw_bonus = bw_bonus_temp * 512;
-		//}
-
-		
 
 		kfg->bandwidth = bw_temp * 512;
-		budget_refill = (bw_temp + bw_bonus_temp) * KYBER_IDEAL_REFILL_TIME;
 
+		// 전송률이 500MiB/s(1024 budget) 이하인 경우 
+		if(kfg->bandwidth < KYBER_BW_THRESHOLD) 
+			budget_refill = div64_u64(KYBER_BW_MAX * KYBER_IDEAL_REFILL_TIME, 512);
+		else 
+			budget_refill = bw_temp * KYBER_IDEAL_REFILL_TIME;
 	}
 	// 모든 cgroup이 idle한 경우
 	else {
-		
-		kfg->bandwidth = KYBER_MAX_BW;
+		kfg->bandwidth = KYBER_BW_MAX;
 		
 		budget_refill = div64_u64(kfg->bandwidth * KYBER_IDEAL_REFILL_TIME, 512);
 		
-		printk(KERN_INFO "\t[@@] spendtime = %lld ms ",spend_time);
-		printk(KERN_INFO "\t[@@] BW = %lld B/ms(%lld MB/s) ", kfg->bandwidth, div_s64(kfg->bandwidth,1000));
-		printk(KERN_INFO "\t[!] After budget refill ");
+		//printk(KERN_INFO "\t[@@] spendtime = %lld ms ",spend_time);
+		//printk(KERN_INFO "\t[@@] BW = %lld B/ms(%lld MB/s) ", kfg->bandwidth, div_s64(kfg->bandwidth,1000));
+		//printk(KERN_INFO "\t[!] After budget refill ");
 		
 		list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
 			kf = id_list->kf;
@@ -1005,46 +1000,49 @@ static void kyber_refill_budget(struct request_queue *q)
 			kf->original_budget = kf->next_budget;
 			kf->cur_budget = kf->next_budget;
 			spin_unlock(&kf->lock);
-			printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d, : IDLE = %s, inactive = %s) : new budget = %lld",
-				kf->id, kf->weight, kf->idle ? "O" : "X", kf->inactive ? "O" : "X" ,kf->next_budget);
+			//printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d, : IDLE = %s, inactive = %s) : new budget = %lld",
+			//	kf->id, kf->weight, kf->idle ? "O" : "X", kf->inactive ? "O" : "X" ,kf->next_budget);
 		}
 		goto end;
 	}
 
 
-
 	// inactive cgroup budget refill
-	rcu_read_lock();
-	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
-		kf = id_list->kf;
+	if (any_inactive) {
+		rcu_read_lock();
+		list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
+			kf = id_list->kf;
 
-		// inactive cgroups budget refill
-		// inactive cgroup이 이전에 부여받은 budget을 모두 소모했다면 원래 비례배분받을 양(X)의 60%만 가지도록 한다.
-		// budget을 모두 소진하지 못하였을 경우 남은 budget을 가지도록 한다.
-		if (!kf->idle && kf->inactive) {
-			spin_lock(&kf->lock);
-			// inactive cgroup의 original_budget 설정
-			// 현재의 총 refill budget에서 자신의 weight에 비례배분하는 양
-			kf->original_budget = div_u64(budget_refill* kf->weight, weight_no_idle);
-			if (kf->cur_budget == 0) {
-				kf->next_budget = div_u64(kf->original_budget * 40, 100);
-				budget_inactive += kf->next_budget;
-			}
-			else {
-				kf->next_budget = kf->cur_budget;
-			}
-			kf->cur_budget = kf->next_budget;
+			// inactive cgroups budget refill
+			// inactive cgroup이 이전에 부여받은 budget을 모두 소모했다면 원래 비례배분받을 양(X)의 60%만 가지도록 한다.
+			// budget을 모두 소진하지 못하였을 경우 남은 budget을 가지도록 한다.
+			if (!kf->idle && kf->inactive) {
+				spin_lock(&kf->lock);
+				// inactive cgroup의 original_budget 설정
+				// 현재의 총 refill budget에서 자신의 weight에 비례배분하는 양
+				if (weight_no_idle == 0) continue;
+				kf->original_budget = div_u64(budget_refill* kf->weight, weight_no_idle);
+				if (kf->cur_budget == 0) {
+					kf->next_budget = div_u64(kf->original_budget * 50, 100);
+					budget_inactive += kf->next_budget;
+				}
+				else {
+					kf->next_budget = kf->cur_budget;
+				}
+				kf->cur_budget = kf->next_budget;
 
-			printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d) : IDLE = %s, inactive = %s : new budget = %lld",
-		 		kf->id, kf->weight, kf->idle ? "O" : "X", kf->inactive ? "O" : "X" ,kf->next_budget);
-			spin_unlock(&kf->lock);
+				//printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d) : IDLE = %s, inactive = %s : new budget = %lld",
+				//	kf->id, kf->weight, kf->idle ? "O" : "X", kf->inactive ? "O" : "X" ,kf->next_budget);
+				spin_unlock(&kf->lock);
+			}
 		}
+		rcu_read_unlock();
 	}
-	rcu_read_unlock();
+	
 
 	budget_active = budget_refill - budget_inactive;
 
-	
+	/*
 	printk(KERN_INFO "\t[CGROUPS] nr_active_cgroup = %d ",kfg->nr_active_cgroup);
 	printk(KERN_INFO "\t[TIME] spendtime = %lld ms ",spend_time);
 	printk(KERN_INFO "\t[USED] used = %lld ", used);
@@ -1054,13 +1052,12 @@ static void kyber_refill_budget(struct request_queue *q)
 	printk(KERN_INFO "\t[REFILL_BUDGET] budget_active = %lld ", budget_active);
 	printk(KERN_INFO "\t[REFILL_BUDGET] budget = %lld ", budget_refill);
 	printk(KERN_INFO "\t[!] After budget refill ");
-	
+	*/
 
 	// active & idle cgroup budget 배분
-	rcu_read_lock();
+
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
 		kf = id_list->kf;
-
 
 		if(kf->inactive) 
 			continue;
@@ -1068,6 +1065,8 @@ static void kyber_refill_budget(struct request_queue *q)
 			weight_temp = weight_active;
 		else if(kf->idle) 
 			weight_temp = weight_all;
+
+		if (weight_temp == 0) continue;
 		
 		spin_lock(&kf->lock);
 		kf->original_budget = div_u64(budget_active* kf->weight, weight_temp);
@@ -1075,12 +1074,12 @@ static void kyber_refill_budget(struct request_queue *q)
 		kf->cur_budget = kf->next_budget;
 		spin_unlock(&kf->lock);
 
-		printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d) : IDLE = %s, inactive = %s :  budget = %lld",
-			kf->id, kf->weight, kf->idle ? "O" : "X", kf->inactive ? "O" : "X" ,kf->next_budget);
+		//printk(KERN_INFO "\t\t[*] Cgroup %d (weight_value= %d) : IDLE = %s, inactive = %s :  budget = %lld",
+		//	kf->id, kf->weight, kf->idle ? "O" : "X", kf->inactive ? "O" : "X" ,kf->next_budget);
 	}
 	rcu_read_unlock();
 	
-	printk(KERN_INFO "<----------------END----------------> ");
+	//printk(KERN_INFO "<----------------END----------------> ");
 
 end:
 	kfg->last_refill_time = ktime_get_ns();
@@ -1221,7 +1220,7 @@ static struct kyber_fairness_global *kyber_fairness_global_init(struct kyber_que
 	}
 
 
-	kfg->bandwidth = KYBER_MAX_BW;
+	kfg->bandwidth = KYBER_BW_MAX;
 	kfg->last_refill_time = ktime_get_ns();
 	kfg->has_work = false;
 	kfg->nr_active_cgroup = 0;
@@ -1404,7 +1403,7 @@ static int kyber_init_hctx(struct blk_mq_hw_ctx *hctx, unsigned int hctx_idx)
 	khd->cur_domain = 0;
 	khd->batching = 0;
 
-	khd->cur_kf = kqd->kfg->root_kf;
+	khd->cur_kf = NULL;
 
 	hctx->sched_data = khd;
 	sbitmap_queue_min_shallow_depth(&hctx->sched_tags->bitmap_tags,
@@ -1751,136 +1750,60 @@ static int kyber_choose_cgroup(struct blk_mq_hw_ctx *hctx)
 	struct kyber_queue_data *kqd = q->elevator->elevator_data;
 	struct kyber_hctx_data *khd = hctx->sched_data;
 	struct kyber_fairness_global *kfg = kqd->kfg;
-	struct kyber_fairness *cuf_kf = khd->cur_kf;
 
 	struct kyber_fairness *kf;
 	struct kyber_id_list *id_list;
 	struct kyber_fairness *kf_choose = NULL;
 
-
 	bool need_refill = true;
 	bool all_idle = true;
 
 
-	//// 설계
-	// 지역성을 활용하기 위해 반드시 이전에 처리한 cgroup 부터 확인해야한다. (이전에 처리한 cgroup = khd->cur_kf)
-	// 만약 이전에 처리한 cgroup이 inactive인 경우 active한 cgroup들부터 확인해야한다.
-	// 만약 refill_budget에서 계산된 active cgroup의 개수가 0인 경우 inactive cgroup의 요청을 처리한다.
-
-
-
-	// 만약 이전에 처리한 cgroup이 active인 경우 확인하고 요청을 처리하지 못하거나 요청이 없는 경우(즉, 건너뛰는 경우)에는
-	// 다른 active cgroup을 확인한다. --> 문제가 되는 부분
-
-	/**** 반드시 로직을 최소화해야함 ****/
-
-
-	// idle cgroup에 대하여
-	// 여기서 idle상태로 마킹되어있는건 레알 idle임 
-	// 즉 요청이 큐에 펜딩되어있는지 확인할 필요도 없음 
-	// 왜냐?
-	// kyber_insert_request에서 요청을 넣을 때 idle상태를 바꿔주기 때문이니깐
-	// 고로 idle하다고 표시된 놈은 무조건 budget이 있는 상태이고 펜딩된 요청이 없는거임
-	// 고로 idle한 놈은 검사할 필요도 없음
-
-
 	// active한 cgroup의 개수 저장
-	int nr_active_cgroup = (kfg->nr_active_cgroup > 0) ? kfg->nr_active_cgroup : -1;
+	int nr_active_cgroup = ( kfg->nr_active_cgroup > 0 ) ? kfg->nr_active_cgroup: -1 ;
 
-	kf = cuf_kf;
 	rcu_read_lock();
-	if (!kf) goto loop;
-
-	if (kf->cur_budget > 0 && kyber_cgroup_is_active(kf->id, hctx)) {
-		kf_choose = kf;
-		goto choose;
-	}
-
-
-
-loop:
 	list_for_each_entry_rcu(id_list, &kfg->use_list, list) {
 		kf = id_list->kf;
 
-		/*
-		// active cgroup
-		else if (!kf->idle && !kf->inactive) {
-			if (kf->cur_budget <= 0)  {
+		if (kf->cur_budget <= 0){
+			kfg->has_work = true;
+			// no budget active cgroup
+			if(!kf->inactive && !kf->idle) {
 				nr_active_cgroup--;
-				if (nr_active_cgroup == 0) goto refill;
-				kfg->has_work = true;
-				continue;
-			}
-			else {
-				if (!kyber_cgroup_is_active(kf->id, hctx)) {
-					all_idle = false;
-					need_refill = false;
-					continue;
-				}
-				else {
-					kf_choose = kf;
-					break;
+				if (nr_active_cgroup == 0) {
+					rcu_read_unlock();
+					goto refill;
 				}
 			}
+			continue;
 		}
-
-		// inactive
 		else {
-			if (kf->cur_budget <= 0) {
-				kfg->has_work = true;
-				continue;
-			}
-			else {
-				if (!kyber_cgroup_is_active(kf->id, hctx)) {
+			if (!kyber_cgroup_is_active(kf->id, hctx)) {
+				if(!kf->idle) {
 					all_idle = false;
 					need_refill = false;
-					continue;
-				}
-				else {
-					kf_choose = kf;
-					break;
-				}
-			}
-		}
-		*/
-
-		//active, inactive cgroup
-		if(!kf->idle){
-			if (kf->cur_budget <= 0)  {
-				kfg->has_work = true;
-				if(!kf->inactive) {
-					nr_active_cgroup--;
-					if (nr_active_cgroup == 0) {
-						rcu_read_unlock();
-						goto refill;
-					}
 				}
 				continue;
 			}
 			else {
-				if (!kyber_cgroup_is_active(kf->id, hctx)) {
-					all_idle = false;
-					need_refill = false;
-					continue;
-				}
-				else {
-					kf_choose = kf;
-					break;
-				}
+				kf_choose = kf;
+				break;
 			}
 		}
 	}
-choose:
 	rcu_read_unlock();
+
 
 	if (kf_choose){
 		kf = khd->cur_kf = kf_choose;
-		if(kf->inactive) {
+		if(kf->inactive && !list_is_last(&kf->id_list->list, &kfg->use_list)) {
 			spin_lock(&kfg->use_lock);
 			list_del_rcu(&kf->id_list->list);
 			list_add_tail_rcu(&kf->id_list->list, &kfg->use_list);
 			spin_unlock(&kfg->use_lock);
 		}
+		//printk(KERN_INFO "\t[CHOOSE] choose cgroup %d : weight = %d, budget = %lld, inactive = %s in cpu %d ",kf->id, kf->weight, kf->cur_budget,kf->inactive ?"O":"X", smp_processor_id());
 		return kf->id;
 	}
 
